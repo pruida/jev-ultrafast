@@ -64,6 +64,16 @@
       const value=e.getAttribute('aria-'+key);
       if (value!==null) base[key]=value;
     }
+    if (rname==='option') {
+      const owners=[...document.querySelectorAll('[aria-controls],[aria-owns]')].filter(field =>
+        visible(field) && ['combobox','textbox','searchbox'].includes(role(field)) &&
+        ((field.getAttribute('aria-controls')||'')+' '+(field.getAttribute('aria-owns')||''))
+          .split(/\s+/).filter(Boolean).some(id => document.getElementById(id)?.contains(e)));
+      if (owners.length===1) {
+        const owner=owners[0];
+        base.autocomplete_value='value' in owner ? String(owner.value) : owner.innerText.trim();
+      }
+    }
     if (['checkbox','radio'].includes(e.type)) base.checked=String(e.checked);
     if (e.tagName==='SELECT') {
       for (const o of e.options) if (!o.selected && !o.disabled && !o.closest('optgroup[disabled]'))
@@ -89,7 +99,18 @@
       words.push(value); length+=value.length;
     }
   }
-  const text=words.join('\n').slice(0,6000), height=document.documentElement.scrollHeight;
+  const text=words.join('\n').slice(0,12000), height=document.documentElement.scrollHeight;
+  const links=[];
+  for (const e of document.querySelectorAll('a[href]')) {
+    if (!visible(e)) continue;
+    try {
+      const href=new URL(e.href,location.href);
+      if (!['http:','https:'].includes(href.protocol)) continue;
+      const label=name(e).trim() || href.href;
+      links.push({label:label.slice(0,500),href:href.href.slice(0,2000)});
+      if (links.length>=100) break;
+    } catch {}
+  }
   const page_key=cache.pageKey(), guards={};
   for (const a of actions) if (!(a.node in guards)) guards[a.node]=cache.guard(cache.nodes.get(a.node));
   // Compare meaning and identity. Geometry is always resolved and hit-tested just before input.
@@ -102,6 +123,6 @@
   if (scrollY+innerHeight<height-2) actions.push({id:'scroll_down',kind:'scroll',label:'Scroll down',delta:560});
   if (scrollY>0) actions.push({id:'scroll_up',kind:'scroll',label:'Scroll up',delta:-560});
   actions.push({id:'wait',kind:'wait',label:'Wait for the page to update'});
-  return {url:location.href,title:document.title,w:innerWidth,h:innerHeight,text,
+  return {url:location.href,title:document.title,w:innerWidth,h:innerHeight,text,links,
     scroll:{y:scrollY,height},actions,marker,page_key,guards,omitted_actions};
 })()

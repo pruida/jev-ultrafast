@@ -31,16 +31,18 @@
         <div class="task-label">
           <label for="goal">Give it a task</label
           ><select id="scenario" name="scenario" aria-label="Demo scenario">
+            <option value="custom" selected>Custom task · choose site automatically</option>
             <option value="flights">Google Flights · real web</option>
             <option value="travel">Travel planner · fixture</option>
             <option value="research">Reading room · fixture</option>
           </select>
         </div>
+        <label for="start-url">Starting URL (optional · leave blank to choose automatically)</label>
+        <input id="start-url" name="url" type="url" placeholder="https://patents.google.com/" />
         <div class="task-row">
-          <textarea id="goal" name="goal" rows="5">
-Find one-way flights from Zurich to London on September 20, 2026, for one adult in economy. Stop when matching flight options are visible. Do not select or book a flight.</textarea
+          <textarea id="goal" name="goal" rows="5" placeholder="Describe what you want to find or do…"></textarea
           ><button type="submit" id="start" class="primary">
-            Start demo <span>↗</span>
+            Start & run <span>↗</span>
           </button>
         </div>
       </form>
@@ -60,6 +62,7 @@ Find one-way flights from Zurich to London on September 20, 2026, for one adult 
         </div>
       </div>
       <div id="error" role="alert" hidden></div>
+      <div id="readiness" class="muted" role="status" hidden></div>
       <section class="workspace">
         <div class="browser-panel">
           <div class="browser-bar">
@@ -119,6 +122,10 @@ Find one-way flights from Zurich to London on September 20, 2026, for one adult 
             Operation and target are separate choices in one request.<br />Text is generated only for TYPE_TEXT.
           </p>
         </aside>
+      </section>
+      <section class="trace" id="report-section" hidden>
+        <div class="trace-heading"><h2>Grounded result</h2><button type="button" id="retry-report">Retry answer</button></div>
+        <p id="report-answer"></p><div id="report-sources"></div><div id="report-limitations"></div>
       </section>
       <section class="trace">
         <div class="trace-heading">

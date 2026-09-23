@@ -107,9 +107,19 @@ class Browser:
         return result
 
     def close(self):
-        if self.target:
+        if not self.target:
+            return
+        try:
             cdp("Target.closeTarget", targetId=self.target)
-            self.target = None
+        except RuntimeError as error:
+            detail = error.args[0] if error.args else None
+            if not (
+                isinstance(detail, dict)
+                and detail.get("code") == -32602
+                and detail.get("message") == "No target with given id found"
+            ):
+                raise
+        self.target = None
 
 
 def fingerprint(state):
