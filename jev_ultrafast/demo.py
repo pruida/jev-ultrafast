@@ -3,6 +3,7 @@
 import atexit
 import json
 import os
+import re
 import secrets
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -10,6 +11,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from .agent import Agent
+from .model import ModelRequestError, choose_start_url, decision_config, validate_browser_url
 from .questions import MAX_STEPS
 
 ROOT = Path(__file__).parent
@@ -20,18 +22,72 @@ LOCK = threading.Lock()
 AGENT = None
 
 
+def _dotenv_value(value):
+    value = value.strip()
+    if value[:1] in {"'", '"'}:
+        quote = value[0]
+        end = value.find(quote, 1)
+        if end < 0:
+            raise ValueError("Unclosed quote in .env")
+        if value[end + 1 :].strip() and not value[end + 1 :].lstrip().startswith("#"):
+            raise ValueError("Unexpected text after quoted .env value")
+        return value[1:end]
+    return re.split(r"\s+#", value, maxsplit=1)[0].strip()
+
+
 def load_environment():
+    """Load conventional .env assignments without overriding the process environment."""
     path = Path.cwd() / ".env"
-    if path.exists():
-        for line in path.read_text().splitlines():
-            if "=" in line and not line.startswith("#"):
-                key, value = line.split("=", 1)
-                os.environ.setdefault(key, value)
+    if not path.exists():
+        return
+    values = {}
+    for number, raw in enumerate(path.read_text().splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)", line)
+        if not match:
+            raise ValueError(f"Invalid .env assignment on line {number}")
+        values[match.group(1)] = _dotenv_value(match.group(2))
+    for key, value in values.items():
+        os.environ.setdefault(key, value)
+
+
+def readiness():
+    text = bool(os.environ.get("TEXT_MODEL_API_KEY"))
+    missing = []
+    try:
+        config = decision_config()
+        choices = bool(os.environ.get(config["key_name"], "").strip())
+        if not choices:
+            missing.append(f"Add {config['key_name']} to choose or run actions. The page can still be observed.")
+    except ValueError as error:
+        choices = False
+        missing.append(str(error))
+    if not text:
+        missing.append(
+            "TEXT_MODEL_API_KEY is needed for automatic site selection, TYPE_TEXT, and final answers. "
+            "A manual URL still allows page observation."
+        )
+    return {"choices": choices, "text": text, "missing": missing}
 
 
 def response_state():
     state = AGENT.snapshot() if AGENT else {"page": None, "status": "idle", "history": [], "decision": None}
-    return {**state, "text_model": os.environ.get("TEXT_MODEL", "deepseek-chat"), "max_steps": MAX_STEPS}
+    try:
+        config = decision_config()
+    except ValueError:
+        config = {"provider": "unconfigured", "model": "unconfigured"}
+    return {
+        "decision_provider": config["provider"],
+        "decision_model": config["model"],
+        **state,
+        "readiness": readiness(),
+        "text_model": os.environ.get("TEXT_MODEL", "deepseek-chat"),
+        "max_steps": MAX_STEPS,
+    }
 
 
 def close_browser():
@@ -44,22 +100,34 @@ def close_browser():
 def command(name, body):
     global AGENT
     if name == "reset":
-        scenario = body.get("scenario", "flights")
-        if scenario not in {"travel", "research", "flights"}:
+        scenario = body.get("scenario", "custom")
+        if scenario not in {"custom", "travel", "research", "flights"}:
             raise ValueError("Unknown demo scenario")
         goal = body.get("goal", "").strip()
         if not goal or len(goal) > 2000:
             raise ValueError("Enter 1–2,000 characters")
-        close_browser()
-        AGENT = Agent(
-            "https://www.google.com/travel/flights?hl=en"
-            if scenario == "flights"
-            else f"{ORIGIN}/fixture.html?scenario={scenario}",
-            goal,
-            screenshots=True,
+        supplied = body.get("url", "").strip()
+        route = None
+        if supplied:
+            url = validate_browser_url(supplied)
+        elif scenario == "flights":
+            url = "https://www.google.com/travel/flights?hl=en"
+        elif scenario in {"travel", "research"}:
+            url = f"{ORIGIN}/fixture.html?scenario={scenario}"
+        else:
+            url, route = choose_start_url(goal)
+        # Keep the old session alive if routing or new-browser initialization fails.
+        candidate = Agent(
+            url, goal, screenshots=True,
             record_dir=Path.cwd() / "artifacts" / "frames" if body.get("record") else None,
         )
+        old, AGENT = AGENT, candidate
+        if old:
+            old.close()
         AGENT.state["scenario"] = scenario
+        AGENT.state["start_url"] = url
+        if route:
+            AGENT.state["text_calls"].append(route)
     else:
         if AGENT is None:
             raise ValueError("Start a demo first")
@@ -102,12 +170,15 @@ class Handler(BaseHTTPRequestHandler):
         self.send(200, content, mime + "; charset=utf-8")
 
     def do_POST(self):
-        if (
-            self.headers.get("Host") != f"127.0.0.1:{PORT}"
-            or self.headers.get("X-Demo-Token") != TOKEN
-            or self.headers.get("Origin") not in (None, ORIGIN)
-        ):
+        if self.headers.get("Host") != f"127.0.0.1:{PORT}" or self.headers.get("Origin") not in (None, ORIGIN):
             return self.send(403, json.dumps({"error": "Local demo requests only"}))
+        if self.headers.get("X-Demo-Token") != TOKEN:
+            return self.send(
+                403,
+                json.dumps(
+                    {"error": "The local demo server restarted. Reload the inspector.", "code": "demo_token_expired"}
+                ),
+            )
         if not LOCK.acquire(blocking=False):
             return self.send(409, json.dumps({"error": "A browser step is already running"}))
         try:
@@ -117,6 +188,8 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(length))
             result = command(self.path.removeprefix("/api/"), body)
             self.send(200, json.dumps(result))
+        except ModelRequestError as error:
+            self.send(400, json.dumps({"error": str(error), "diagnostic": error.diagnostic}))
         except (ValueError, RuntimeError, TimeoutError) as error:
             self.send(400, json.dumps({"error": str(error)}))
         except Exception:

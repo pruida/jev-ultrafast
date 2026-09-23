@@ -5,8 +5,11 @@ import time
 from pathlib import Path
 
 from .browser import Browser, StalePage
-from .model import action_space, choose, field_context, field_text
+from .model import action_space, choose, field_context, field_text, final_report
 from .questions import MAX_STEPS
+
+MAX_EVIDENCE_PAGES = 20
+MAX_EVIDENCE_CHARS = 60000
 
 
 class Agent:
@@ -35,19 +38,69 @@ class Agent:
             plan_index=0,
             decisions=[],
             text_calls=[],
+            evidence=[],
+            evidence_truncated=False,
+            report=None,
+            report_error=None,
+            stop_reason=None,
             elapsed_ms=0,
             started_at=None,
             record=bool(self.record_dir),
         )
+        self._collect_evidence(page)
         if self.record_dir:
             self.record_dir.mkdir(parents=True, exist_ok=True)
             (self.record_dir / "000000.jpg").write_bytes(base64.b64decode(page["screenshot"]))
 
     def snapshot(self):
+        public = {k: v for k, v in self.state.items() if k != "browser"}
+        public["evidence"] = [{k: v for k, v in item.items() if k != "_signature"} for item in self.state["evidence"]]
         return {
-            **{k: v for k, v in self.state.items() if k != "browser"},
+            **public,
             "elements": action_space(self.state["page"]["actions"])[0],
         }
+
+    def _collect_evidence(self, page):
+        state = self.state
+        text = page.get("text", "")
+        links = page.get("links", [])
+        item = {"url": page["url"], "title": page.get("title", ""), "text": text, "links": links}
+        signature = (item["url"], item["title"], item["text"], tuple((x.get("label"), x.get("href")) for x in links))
+        if any(e.get("_signature") == signature for e in state["evidence"]):
+            return
+        used = sum(len(e["text"]) + sum(len(x.get("label", "")) + len(x.get("href", "")) for x in e["links"])
+                   for e in state["evidence"])
+        if len(state["evidence"]) >= MAX_EVIDENCE_PAGES or used >= MAX_EVIDENCE_CHARS:
+            state["evidence_truncated"] = True
+            return
+        remaining = MAX_EVIDENCE_CHARS - used
+        item["text"] = item["text"][:remaining]
+        remaining -= len(item["text"])
+        kept = []
+        for link in links:
+            cost = len(link.get("label", "")) + len(link.get("href", ""))
+            if cost > remaining:
+                state["evidence_truncated"] = True
+                break
+            kept.append(link)
+            remaining -= cost
+        item["links"] = kept
+        item["_signature"] = (
+            item["url"], item["title"], item["text"],
+            tuple((x.get("label"), x.get("href")) for x in kept),
+        )
+        state["evidence"].append(item)
+
+    def generate_report(self):
+        state = self.state
+        evidence = [{k: v for k, v in item.items() if k != "_signature"} for item in state["evidence"]]
+        report, helper = final_report(
+            state["goal"], evidence, state["stop_reason"] or state["status"], state["evidence_truncated"]
+        )
+        state["report"] = report
+        state["report_error"] = None
+        state["text_calls"].append(helper)
+        return self.snapshot()
 
     def command(self, name, body=None):
         body = body or {}
@@ -60,6 +113,7 @@ class Agent:
                 state["decision"] = None
                 state["status"] = "ready"
                 state["page"] = state["browser"].observe(screenshot=self.screenshots)
+                self._collect_evidence(state["page"])
                 state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
                 return self.snapshot()
         elif name == "predict":
@@ -95,6 +149,7 @@ class Agent:
                     state["status"] = "ready"
                     raise StalePage("Page changed since the decision. Choose again.")
                 state["status"] = "done" if selected == "DONE" else "blocked"
+                state["stop_reason"] = selected.lower()
                 state["plan_index"] = int(selected == "DONE")
                 state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
                 return self.snapshot()
@@ -110,7 +165,13 @@ class Agent:
                 if self.pending_text and self.pending_text[0] == context:
                     _, text, helper = self.pending_text
                 else:
-                    text, helper = field_text(context)
+                    try:
+                        text, helper = field_text(context)
+                    except (ValueError, RuntimeError):
+                        # No browser input occurred, so keep the inspected decision available to retry.
+                        state["decision"] = decision
+                        state["status"] = "predicted"
+                        raise
                     self.pending_text = (context, text, helper)
                     state["text_calls"].append({**helper, "field": action["label"], "value": text})
             # Browser.act checks freshness immediately before input, including after text generation.
@@ -124,7 +185,7 @@ class Agent:
                     "action": action["label"],
                     "kind": action["kind"],
                     "choice": selected,
-                    "probability": decision["probabilities"][selected],
+                    "probability": decision["probabilities"].get(selected),
                     "confidence": decision["confidence"],
                     "latency_ms": decision["latency_ms"],
                     "text": text,
@@ -140,6 +201,7 @@ class Agent:
                 }
             )
             state["page"] = state["browser"].observe(screenshot=self.screenshots)
+            self._collect_evidence(state["page"])
             state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
             state["history"][-1].update(
                 page_changed=state["page"]["fingerprint"] != page["fingerprint"],
@@ -151,11 +213,12 @@ class Agent:
                     base64.b64decode(state["page"]["screenshot"])
                 )
             repeated = state["history"][-3:]
-            state["status"] = (
-                "blocked"
-                if len(repeated) == 3 and all(h["page_changed"] is False and h["kind"] != "wait" for h in repeated)
-                else "ready"
-            )
+            stuck = len(repeated) == 3 and all(h["page_changed"] is False and h["kind"] != "wait" for h in repeated)
+            state["status"] = "blocked" if stuck else "ready"
+            if stuck:
+                state["stop_reason"] = "no_progress"
+        elif name == "report":
+            return self.generate_report()
         else:
             raise ValueError("Unknown command")
         return self.snapshot()

@@ -35,12 +35,14 @@ function controls() {
   $("start").disabled = busy;
   $("scenario").disabled = busy;
   $("goal").disabled = busy;
+  $("start-url").disabled = busy;
   $("choose").disabled = busy || !live;
   $("execute").disabled = busy || !state?.decision || !live;
   $("auto").disabled = busy || !live;
   $("auto").hidden = automatic;
   $("stop").hidden = !automatic;
   $("download").disabled = !state?.history?.length;
+  $("retry-report").disabled = busy || !state?.evidence?.length;
 }
 async function perform(fn, label) {
   if (busy) return;
@@ -133,6 +135,12 @@ function render() {
         .join("")
     : '<p class="muted">Each executed action leaves an observed result.</p>';
   $("step-count").textContent = `${state.history.length} actions · ${(state.elapsed_ms / 1000).toFixed(2)} s`;
+  const report = state.report;
+  $("report-section").hidden = !(report || state.report_error || ["done", "blocked"].includes(state.status));
+  $("report-answer").textContent = report?.answer || state.report_error || (["done", "blocked"].includes(state.status) ? "Generate an evidence-grounded answer." : "");
+  $("report-sources").replaceChildren();
+  for (const source of report?.sources || []) { const a=document.createElement("a"); a.href=source; a.textContent=source; a.target="_blank"; a.rel="noopener"; $("report-sources").append(a, document.createElement("br")); }
+  $("report-limitations").textContent = (report?.limitations || []).join(" · ");
   $("model-state").textContent = JSON.stringify(
     d?.request || {
       goal: state.goal,
@@ -149,14 +157,19 @@ $("task-form").addEventListener("submit", (event) => {
   event.preventDefault();
   automatic = false;
   perform(
-    () =>
-      call("reset", { scenario: $("scenario").value, goal: $("goal").value }),
+    async () => {
+      await call("reset", { scenario: $("scenario").value, goal: $("goal").value, url: $("start-url").value.trim() });
+      await runAutomatically();
+    },
     "Opening a fresh browser…",
   );
 });
 $("scenario").addEventListener("change", () => {
-  $("goal").value = goals[$("scenario").value];
+  const scenario = $("scenario").value;
+  $("goal").value = goals[scenario] || "";
+  $("start-url").value = scenario === "flights" ? "https://www.google.com/travel/flights?hl=en" : scenario === "custom" ? "" : `${location.origin}/fixture.html?scenario=${scenario}`;
 });
+$("retry-report").addEventListener("click", () => perform(() => call("report"), "Generating a grounded answer…"));
 $("choose").addEventListener("click", () =>
   perform(() => call("predict"), "Jev is comparing the actions…"),
 );
@@ -166,8 +179,7 @@ $("execute").addEventListener("click", () =>
     "Executing the choice…",
   ),
 );
-$("auto").addEventListener("click", () =>
-  perform(async () => {
+async function runAutomatically() {
     automatic = true;
     controls();
     for (let i = 0; i < state.max_steps * 2 && automatic; i++) {
@@ -180,10 +192,15 @@ $("auto").addEventListener("click", () =>
       } else {
         await call("tick");
       }
-      if (["done", "blocked"].includes(state.status)) break;
+      if (["done", "blocked"].includes(state.status)) {
+        try { await call("report"); } catch (error) { state.report_error = error.message; render(); }
+        break;
+      }
     }
     automatic = false;
-  }, "Running the browser…"),
+}
+$("auto").addEventListener("click", () =>
+  perform(runAutomatically, "Running the browser…"),
 );
 $("stop").addEventListener("click", () => {
   automatic = false;
@@ -233,12 +250,23 @@ $("download").addEventListener("click", () => {
   a.click();
   URL.revokeObjectURL(url);
 });
-fetch("/api/state")
-  .then((r) => r.json())
-  .then((s) => {
-    state = s;
+async function initialize() {
+  try {
+    const response = await fetch("/api/state");
+    if (!response.ok) throw Error(`State request failed: HTTP ${response.status}`);
+    state = await response.json();
+  } catch (error) {
+    $("status").textContent = "Cannot load local demo state";
+    $("error").textContent = error.message;
+    $("error").hidden = false;
+    return;
+  }
+  try {
     render();
-  })
-  .catch(() => {
-    $("status").textContent = "Cannot reach local demo server";
-  });
+  } catch (error) {
+    $("status").textContent = "Inspector rendering failed";
+    $("error").textContent = error.message;
+    $("error").hidden = false;
+  }
+}
+initialize();
